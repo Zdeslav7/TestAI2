@@ -1,0 +1,79 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { OpenAI } from 'openai';
+import pdf from 'pdf-parse';
+import { createClient } from '@supabase/supabase-js';
+
+// Inicjalizacja Supabase
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!, 
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+export async function POST(req: NextRequest) {
+  try {
+    const formData = await req.formData();
+    const file = formData.get('file') as File;
+    if (!file) return NextResponse.json({ error: 'No file' }, { status: 400 });
+
+    // 1. Pobierz tekst z pliku
+    let text = '';
+    if (file.type === 'application/pdf') {
+      const buffer = Buffer.from(await file.arrayBuffer());
+      const data = await pdf(buffer);
+      text = data.text;
+    } else {
+      text = await file.text();
+    }
+
+    // 2. Wyślij do GPT-4o
+    const completion = await openai.beta.chat.completions.parse({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: "Jesteś ekspertem. Wyodrębnij dane i zwróć JSON. Klucz 'raw_text_snippet' musi być dokładnym cytatem z tekstu." },
+        { role: "user", content: text }
+      ],
+      response_format: {
+        type: "json_object",
+        schema: {
+          type: "object",
+          properties: {
+            claim_number: { type: "string" },
+            amount_net: { type: "number" },
+            currency: { type: "string", default: "PLN" },
+            incident_date: { type: "string" },
+            category: { type: "string", enum: ["TABOR", "OSOBOWA", "MAJATKOWA"] },
+            confidence_score: { type: "number" },
+            raw_text_snippet: { type: "string" },
+            ai_notes: { type: "string" }
+          },
+          required: ["claim_number", "amount_net", "incident_date", "category", "confidence_score", "raw_text_snippet", "ai_notes"]
+        }
+      },
+    });
+
+    const data = completion.choices[0].message.parsed;
+    if (!data) throw new Error("LLM Parse Failed");
+
+    // 3. Zapisz do bazy
+    const { error } = await supabase.from('claims_staging').insert({
+      claim_number: data.claim_number,
+      amount_net: data.amount_net,
+      currency: data.currency || 'PLN',
+      incident_date: data.incident_date,
+      category: data.category,
+      confidence_score: data.confidence_score,
+      raw_text_snippet: data.raw_text_snippet,
+      ai_notes: data.ai_notes,
+      source_filename: file.name,
+      status: 'PENDING'
+    });
+
+    if (error) throw error;
+    return NextResponse.json({ success: true });
+
+  } catch (e) {
+    console.error(e);
+    return NextResponse.json({ error: 'Server Error' }, { status: 500 });
+  }
+}

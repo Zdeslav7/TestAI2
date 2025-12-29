@@ -1,0 +1,1 @@
+npm install @supabase/supabase-js openai pdf-parse lucide-react clsx tailwind-merge
